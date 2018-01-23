@@ -138,14 +138,14 @@ struct
       Reply_to (query, pkt)
     with Not_found -> Reply_unlinked (len, hdr)
 
-  let pretty_string_of_reply pkt =
+  let pretty_string_of_reply query pkt =
     let id =
       Unsigned.UInt64.to_int64 Profuse.(Ctypes.getf pkt.hdr Out.Hdr.T.unique)
     in
     match Ctypes.getf pkt.Profuse.hdr Profuse.Out.Hdr.T.error with
     | 0_l ->
-      Printf.sprintf "returning %s from %Ld"
-        (Profuse.Out.Message.describe pkt) id
+      Printf.sprintf "returning %s from %Ld (%s)"
+        (Profuse.Out.Message.describe pkt) id (Query.pretty query)
     | nerrno ->
       let nerrno = Int64.of_int32 nerrno in
       let host = Profuse.(pkt.chan.host.Host.errno) in
@@ -169,7 +169,7 @@ struct
         (String.concat ", " (List.map Errno.to_string errnos)) id
 
   let pretty = function
-  | Reply_to (_q, r) -> pretty_string_of_reply r
+  | Reply_to (q, r) -> pretty_string_of_reply q r
   | Reply_unlinked (len, hdr) -> pretty_string_of_reply_unlinked len hdr
 end
 
@@ -242,6 +242,34 @@ let show time session_file =
               (Printexc.get_backtrace ())
            )
 
+let summarise session_file =
+  try
+    let opcode_count = Hashtbl.create 51 in
+    with_open_fd session_file @@ fun fd ->
+    let session = packet_stream_of_fd fd in
+    iter (function
+      | _time, Query packet ->
+        let opcode = Profuse.In.Opcode.of_uint32 @@ Ctypes.getf packet.Profuse.hdr Profuse.In.Hdr.T.opcode in
+        let old_count = if Hashtbl.mem opcode_count opcode then Hashtbl.find opcode_count opcode else 0 in
+        Hashtbl.replace opcode_count opcode (old_count + 1);
+      | _time, Reply _ -> ()
+    ) session;
+    Printf.fprintf stderr "# The most popular FUSE opcodes:\n";
+    Hashtbl.fold (fun x y acc -> (x, y) :: acc) opcode_count []
+    |> List.sort (fun (_, count1) (_, count2) -> compare count1 count2) (* ascending *)
+    |> List.rev (* but we want descending, most popular first *)
+    |> List.iter
+      (fun (opcode, count) ->
+        Printf.fprintf stderr "%s %d\n" (Profuse.In.Opcode.to_string opcode) count
+      );
+    `Ok ()
+  with exn ->
+    `Error (false,
+            Printf.sprintf "Couldn't parse FUSE session %s: %s\n%s\n%!"
+              session_file (Printexc.to_string exn)
+              (Printexc.get_backtrace ())
+          )
+
 open Cmdliner
 
 let time_label = Arg.enum [
@@ -261,11 +289,20 @@ let show_cmd =
   Term.(ret (pure show $ time $ session)),
   Term.info "show" ~doc
 
-let cmds = [show_cmd]
+let summarise_cmd =
+  let doc = "summarise the activity in a session" in
+  let session = Arg.(
+    value (pos 0 file (Sys.getcwd ()) (info ~docv:"SESSION" []))
+  ) in
+  Term.(ret (pure summarise $ session)),
+  Term.info "summarise" ~doc
+
+let cmds = [show_cmd; summarise_cmd]
 
 let help_cmd =
   let show_usage =
-    "  show [SESSION]   Read the packets in SESSION and print to stdout.\n"
+    "  show [SESSION]      Read the packets in SESSION and print to stdout.\n\
+       summarise [SESSION] Read the packets in SESSION and print a summary.\n";
   in
   let usage () = Printf.printf
       "fusedump %s\n\nSubcommands:\n%s\n" version show_usage
